@@ -599,3 +599,204 @@ class RnnSandwich(tf.keras.Sequential):
     super().__init__(layers, **kwargs)
 
 
+# ------------------ Embeddings ------------------------------------------------
+def get_embedding(vocab_size=1024, n_dims=256):
+  """Get a real-valued embedding from an integer."""
+  return tfkl.Embedding(
+      input_dim=vocab_size,
+      output_dim=n_dims,
+      input_length=1)
+
+
+# ------------------ Normalization ---------------------------------------------
+class ConditionalScaleAndShift(tfkl.Layer):
+  """Conditional scaling and shifting after normalization."""
+
+  def __init__(self, shift_only=False, **kwargs):
+    super().__init__(**kwargs)
+    self.shift_only = shift_only
+
+  def build(self, inputs_shapes):
+    x_shape, _ = inputs_shapes
+    self.x_ch = int(x_shape[-1])
+    ch = self.x_ch if self.shift_only else 2 * self.x_ch
+    self.dense = tfkl.Dense(ch)
+
+  def call(self, inputs):
+    """Conditional scaling and shifting after normalization."""
+    x, z = inputs
+    if self.shift_only:
+      shift = self.dense(z)
+      x += shift
+    else:
+      scale_shift = self.dense(z)
+      scale = scale_shift[..., :self.x_ch]
+      shift = scale_shift[..., self.x_ch:]
+      x = (x * scale) + shift
+    return x
+
+
+@gin.register
+class ConditionalNorm(tfkl.Layer):
+  """Apply normalization and then conditional scale and shift."""
+
+  def __init__(self,
+               norm_type='instance',
+               shift_only=False,
+               **kwargs):
+    """Apply normalization and then conditional scale and shift.
+
+    Args:
+      norm_type: Choose between 'group', 'instance', and 'layer' normalization.
+      shift_only: Only apply a conditional shift, with no conditional scaling.
+      **kwargs: Keras-specific constructor kwargs.
+    """
+    super().__init__(**kwargs)
+    self.norm_type = norm_type
+    self.conditional_scale_and_shift = ConditionalScaleAndShift(
+        shift_only=shift_only)
+
+  def call(self, inputs):
+    """Apply normalization and then conditional scale and shift.
+
+    Args:
+      inputs: Pair of input tensors. X of shape [batch, height, width, ch], and
+        z, conditioning tensor of a shape broadcastable to [batch, height,
+        width, channels].
+
+    Returns:
+      Normalized and scaled output tensor of shape
+          [batch, height, width, channels].
+    """
+    x, z = inputs
+    x = normalize_op(x, norm_type=self.norm_type)
+    return self.conditional_scale_and_shift([x, z])
+
+
+# ------------------ Stacks ----------------------------------------------------
+@gin.register
+class SingleGru(tf.keras.Sequential):
+  """Makes a GRU -> LayerNorm -> Dense network."""
+
+  def __init__(self, gru_dim=128, **kwargs):
+    layers = [
+        tfkl.GRU(gru_dim, return_sequences=True),
+        tfkl.LayerNormalization()
+    ]
+    super().__init__(layers, **kwargs)
+
+
+@gin.register
+class DilatedConvStack(tfkl.Layer):
+  """Stack of dilated 1-D convolutions, optional conditioning at each layer."""
+
+  def __init__(self,
+               ch=256,
+               layers_per_stack=5,
+               stacks=2,
+               kernel_size=3,
+               dilation=2,
+               norm_type=None,
+               resample_type=None,
+               resample_stride=2,
+               stacks_per_resample=1,
+               shift_only=False,
+               conditional=False,
+               **kwargs):
+    super().__init__(**kwargs)
+    self.conditional = conditional
+    self.norm_type = norm_type
+
+    def dilated_conv(i):
+      if dilation > 0:
+        dilation_rate = int(dilation ** i)
+      else:
+        # If dilation is negative, decrease dilation with depth instead of
+        # increasing.
+        dilation_rate = int((-dilation) ** (layers_per_stack - i - 1))
+      layer = tf.keras.Sequential(name='dilated_conv')
+      layer.add(tfkl.Activation(tf.nn.relu))
+      layer.add(tfkl.Conv2D(ch,
+                            (kernel_size, 1),
+                            dilation_rate=(dilation_rate, 1),
+                            padding='same'))
+      return layer
+
+    # Layers.
+    self.conv_in = tfkl.Conv2D(ch, (kernel_size, 1), padding='same')
+    self.layers = []
+    self.norms = []
+    self.resample_layers = []
+    for i in range(stacks):
+      for j in range(layers_per_stack):
+        # Convolution.
+        layer = dilated_conv(j)
+        # Normalization / scale and shift.
+        if self.conditional:
+          norm = ConditionalNorm(norm_type=norm_type, shift_only=shift_only)
+        else:
+          norm = Normalize(norm_type=norm_type)
+
+        # Add to the stack.
+        self.layers.append(layer)
+        self.norms.append(norm)
+
+      # Resampling.
+      if resample_type and (i + 1) % stacks_per_resample == 0:
+        if resample_type == 'downsample':
+          resample_layer = tfkl.Conv2D(
+              ch, (resample_stride, 1), (resample_stride, 1), padding='same')
+        elif resample_type == 'upsample':
+          resample_layer = tfkl.Conv2DTranspose(
+              ch, (resample_stride * 2, 1), (resample_stride, 1),
+              padding='same')
+        else:
+          raise ValueError('invalid resample type: %s' % resample_type)
+        self.resample_layers.append(resample_layer)
+
+  def call(self, inputs):
+    # Get inputs.
+    if self.conditional:
+      x, z = inputs
+      x = ensure_4d(x)
+      z = ensure_4d(z)
+    else:
+      x = inputs
+      x = ensure_4d(x)
+
+    # Run them through the network.
+    x = self.conv_in(x)
+
+    for i, (layer, norm) in enumerate(zip(self.layers, self.norms)):
+      # Scale and shift by conditioning.
+      if self.conditional:
+        y = layer(x)
+        x += norm([y, z])
+
+      # Regular residual network.
+      else:
+        x += norm(layer(x))
+
+      if self.resample_layers:
+        # Resample at the end of each sequence of dilated conv stacks.
+        layers_per_resample = len(self.layers) // len(self.resample_layers)
+        if (i + 1) % layers_per_resample == 0:
+          x = self.resample_layers[i // layers_per_resample](x)
+
+    return x[:, :, 0, :]  # Convert back to 3-D.
+
+
+@gin.register
+class FcStackOut(tfkl.Layer):
+  """Stack of FC layers with variable hidden and output dims."""
+
+  def __init__(self, ch, layers, n_out, **kwargs):
+    super().__init__(**kwargs)
+    self.stack = FcStack(ch, layers)
+    self.dense_out = tfkl.Dense(n_out)
+
+  def call(self, x):
+    x = self.stack(x)
+    return self.dense_out(x)
+
+
